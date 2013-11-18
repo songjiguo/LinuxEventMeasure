@@ -1,0 +1,214 @@
+Hi Gabe, 
+
+Here are some measurement configurations and system settings for
+different micro-benchmarks. Also I list some measurement results
+along, however, I have not run many times to get stddev yet. I just
+want to make sure that the numbers make sense before I start run many
+times. Also I leave some background note, just for the future
+reference purpose. The timing when rdtsc is executed is embedded in
+the measurement steps.
+
+Todo: 
+1) Asynchronous processing (maybe can repeat what Qi already has)
+2) Device data arrival and processing (e.g. network interrupt), and I
+   plan to do this after Wednesday presentation
+3) Fix any bugs in the following benchmarks.
+4) Write the script to run many times and get the avg and stddev
+5) Run these micro-benchmarks on RT-Linux as well
+
+
+To run the test (no script yet, and better as superuser)
+1) make init
+2) make all
+3) ./pipes
+4) ./cv
+5) ./tlbflush
+6) ./timer
+
+
+///////////////////////////
+Asynchronous communication:
+///////////////////////////
+
+  Micro-benchmark fro Linux event -- SMP pipe communication
+ 
+  Note:
+  pipe() syscall will create a half-duplex pipe in POSIX. Two file descriptors are used to 
+  refer to the two ends of the pipe (fd[0] -> read end, fd[1] -> write end).
+  Data written to the write end of the pipe is buffered by the kernel until 
+  it is read from the read end of the pipe. For SMP, we need a pair of pipes to measure
+  the overhead of the pipe (can not rdtsc on the different core/thread)
+  
+  System setup (pipe in threads/processes)
+   -- writer thread (w_thd)
+   -- reader thread (r_thd)
+   -- 2 cores (core 0 and core 1)
+   -- a pair of pipes (A and B)
+ 
+  Measure steps:
+   1) pin r_thd to the core 0
+   2) pin w_thd to the core 1
+   3) pipe A and B are empty initially
+   rdtsc(start)
+   4) w_thd writes 1 byte into the pipe A (will wait if there is no space)
+   5) w_thd reads byte from pipe B (will block if r_thd has not written in pipe B yet)
+   6) switch to r_thd
+   7) r_thd reads from the pipe A (will wait if there is no data in the pipe A)
+   8) r_thd writes 1 byte into the pipe B
+   9) switch to w_thd
+   10) w_thd reads from pipe B
+   rdtsc(end)
+
+  Result:  8770 cycles (for 2 cores and just 1 page shared & access)
+
+  records 500
+  average 8769.87
+  stdev   61.5035
+
+   
+///////////////////////////
+Maintaining consistency:
+///////////////////////////
+
+  Micro-benchmark fro Linux event -- SMP TLB shootdown
+ 
+  Note:
+  TLB shootdown procedure (When the access permission to a page is modified. e.g munmap)
+  1) core 0 locks down the page table
+  2) find the set of affected cores
+  3) send IPI to those cores
+  4) remote cores execute ISR for TLB invalidation
+  5) then send acknowledgment msg back to core 0
+  6) core 0 releases lock and continue the execution
+
+  System setup (one thread on each core)
+   -- up to 80 cores
+   -- 1 thread on core 0 (main thread)
+   -- 79 threads on other 79 cores
+ 
+  Measure steps: (measure the overhead of above TLB shootdown step 1 to 6)
+  1) Assign each thread to a core (1 main thread an rest are workers)
+  2) N*Pages shared among all cores (e.g all threads) from main thread
+  3) main thread touches the shared region
+  4) Each thread touches the shared region
+  5) rdtsc(start)
+  6) main thread munmap the shared memory
+  7) rdtsc(end)
+  8) overhead of TLB shootdown (e.g. IPI) = end-start
+ 
+
+  Result:   93960 cycles (for 2 cores)
+
+  records 500
+  average 69907.3
+  stdev   12548.6
+
+//////////////////////////////////////
+Concurrency/Parallelism management
+//////////////////////////////////////
+
+  Micro-benchmark fro Linux event -- SMP conditional variable for 2 cores
+ 
+  System setup (one thread on each core)
+   -- 1 thread (H) on core 1 with higher priority
+   -- 1 thread (L) on core 2 with lower priority
+   -- 2 conditional variables (cv1 and cv2)
+   -- 2 mutex (mutex1 and mutex2)
+ 
+  Measure steps:
+  1) Assign each thread to a core (H on core 1 and L on core 2)
+  2) H takes mutex1
+  3) H waits on cv1 (releases mutex1 at the same time)
+  4) L takes mutex1
+ rdtsc(start1) in L
+  5) L sends signal to cv1
+  6) L releases mutex1
+  7) L takes mutex2
+  8) L waits on cv2 (releases mutex2 at the same time)
+ rdtsc(end1) in H
+  9) H takes mutex2
+ rdtsc(start2) in H
+ 10) H sends signal to cv2
+ 11) H releases mutex2 and block
+ rdtsc(end2) in L
+ 12) L releases mutex2 and block
+ 13) H terminates and L terminates
+
+ Note: end1-start1+end2-start2 == end2-start1+end1-start2 (rdtsc on the same cores) 
+       result is from the average of above number
+
+ Result:   51204 cycles (2 cores)
+
+ records 500
+ average 12459.8
+ stdev   195.265
+
+///////////////////
+Time management
+///////////////////
+
+  Micro-benchmark fro Linux event -- timer interrupt
+ 
+  System setup (only 1 thread on a core)
+   -- 1 thread T on core 1 with the highest priority
+ 
+  Measure steps:
+  1) Set T with the highest priority and pin to one core
+  2) Set the timer by which SIGALRM will trigger a handler later when timer interrupt occurs
+  3) Let T spin
+  rdtsc(start) in T
+  4) Timer interrupt happens and triggers the handler
+  rdtsc(end) in handler
+
+  Note: This is adapted from Sched_benchmark/timer.c by Gabe
+
+  Result:     11100 cycles (1 core)
+
+  records 500
+  average 6147.38
+  stdev   116.669
+
+
+///////////////////
+// Network
+///////////////////
+
+  Micro-benchmark fro Linux event -- Network interrupt on single core (server)
+
+  Server setup
+   SCHED_RR
+    -- 1 thread (H) on machine X with higher priority 98
+    -- 1 thread (L) on machine X with lower priority  19
+   Client setup (local test)
+    -- 1 thread on machine Y, sending UDP packets
+
+   Measure steps:
+   -- server
+    1) On server side, using SCHED_RR (RT prio 0~99)
+    2) Assign H and L on core 4
+    3) H's prio = 98 and L's prio = 19
+    4) H opens tun device
+    5) H blocks read on tun device (arrival packets)
+    6) L keeps spinning
+     rdtsc(start) in L
+    7) when packets arrive and trigger the interrupt, H will continue to consume the data
+     rdtsc(end) in H
+    8) repeat 4) for fix times (e.g. MAX_UDP_PACKETS)
+    9) finally compute the average cost of network interrupt
+
+   -- client
+   1) generating UDP packets and send to server (e.g. MAX_UDP_PACKETS)
+
+   Note: To run the test, 1) start server first by executing ./network_server
+                          2) run ./run.sh on the different machine or cores
+ 			  3) both need su
+
+
+ records 500
+ average 4245.08
+ stdev   165.085
+
+
+
+Best,
+Jiguo
